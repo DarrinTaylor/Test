@@ -1,0 +1,270 @@
+#### playbook for Cisco MSN D2 SIAD HD S9500 Shorthaul Port Decom (IMPL) ####
+
+# Connect to Siad
+- name: Connect to SIAD
+  hosts: '{{ derived_data.siad.clli }}'
+  connection: ansible.netcommon.network_cli
+  gather_facts: False
+
+  tasks:
+    - set_fact:
+        target_port: "{{derived_data.cabinet.siad_port}}"
+        oam_vlan_id: "{{ derived_data.cabinet.oam_vlan_id }}"
+        bearer_vlan_id: "{{ derived_data.cabinet.bearer_vlan_id }}"
+        ospf_area: "{{derived_data.siad.ospf_area}}"
+        cabinet_type: "{{derived_data.cabinet.type}}"
+        bbu_list: []
+        f_last_bbu: false
+        f_mmbb_vlan: false
+
+    # Step 1 start (MOP Step 1,2)
+    - set_fact:
+        cli: 
+          - "config"
+          - "delete interface dataplane {{ target_port }}"
+          - "set interface dataplane {{ target_port }} disable"
+          - "delete interface switch sw0 vif {{ oam_vlan_id }}"
+          - "delete interface switch sw0 vif {{ bearer_vlan_id }}"
+          - "commit"
+    # Step 1 stop (MOP Step 1,2)
+
+   # Step 2 start (MOP Step 3,4,5 )   
+    - name: Determine 3rd/4th vlan availablity          
+      set_fact: 
+        ptpvlan: "{{ derived_data.cabinet.ptp_vlan_id }}"
+        f_ptp_vlan: False
+        bc_ptp_vlan_id: "{{derived_data.cabinet.bc_ptp_vlan_id}}"
+        f_bc_ptp_vlan: False
+        f_mmbb_vlan: False
+
+    - vars:      
+        - temp_var: "delete interfaces switch sw0 vif {{ ptpvlan }}"
+      set_fact:
+        f_ptp_vlan: True
+        cli: "{{ cli + [ temp_var ] }}"
+      when: ptpvlan | length != 0
+    
+    - vars:      
+        - temp_var: "delete interfaces switch sw0 vif {{ bc_ptp_vlan_id }}"
+      set_fact:
+        f_bc_ptp_vlan: True
+        cli: "{{ cli + [ temp_var ] }}"
+      when: bc_ptp_vlan_id | length != 0
+
+    - block: 
+        - set_fact:
+            mmbbvlan: "{{ derived_data.cabinet.mmbb_vlan_id }}"   
+        - vars:
+            - temp_var: "delete interfaces switch sw0 vif {{ mmbbvlan }}"
+          set_fact:
+            f_mmbb_vlan: True
+            cli: "{{ cli + [ temp_var ] }}"
+          when: derived_data.cabinet.is_mmbb == true
+      when: cabinet_type == 'enb' 
+
+    - vars:
+        - temp_var: "commit"
+      set_fact:
+        cli: "{{ cli + [ temp_var ] }}"
+
+    - name: From the SIAD delete and shutdown the port interface for the target node and Remove all associated shorthaul vlans
+      vars:
+        - current_step: {step: 1 , progress: +, section: "Implementation"}
+        - log_footer: True
+      vyos_command:
+        commands: "{{ cli  + [ 'exit' ]}}"
+    # Step 2 end
+
+    # Step 3 start (MOP Step 6)
+    - name: From the SIAD verify that the correct PORT was deleted
+      vars:
+        - current_step: {step: +, progress: +, section: "Implementation"}
+      vyos_command:
+        commands: "show interface dataplane {{target_port}}"
+      register: siad_verify_port
+
+    - name: Verify the result 
+      vars:
+        - log_footer: True        
+      assert:
+        that: 
+          - siad_verify_port.stdout is search("disable")
+          - siad_verify_port.stdout is search(target_port)          
+        fail_msg:  "The target port [{{target_port}}] still in config"
+        success_msg:  "The target port [{{target_port}}] was removed (passed)"
+    # Step 3 end
+
+    # Step 4 start (MOP Step 7)
+    - name: From the SIAD verify that the correct PORT was deleted 
+      vars:
+        - current_step: {step: +, progress: +, section: "Implementation"}
+      vyos_command:
+        commands:  "show configuration commands | egrep {{target_port}}"
+      register: siad_show_configuration_commands
+
+    - name: Verify the result
+      vars:
+        - log_footer: True        
+      assert:
+        that: 
+          - siad_show_configuration_commands.stdout[0] is search("disable")
+          - siad_show_configuration_commands.stdout[0] is search(target_port)            
+        fail_msg:  "The target port [{{target_port}}] still in config"
+        success_msg:  "The target port [{{target_port}}] was removed (passed)"
+    # Step 4 end
+
+    # Step 5 start (MOP Step 8,9)
+    - block:
+        - name: intialize commands for step 8 and 9 nodeb
+          set_fact:
+            cli2:
+              - "config"
+              - "delete protocols ospf area {{ospf_area}} network {{derived_data.cabinet.bearer_subnet}}/28"
+              - "delete protocols ospf area {{ospf_area}} network {{derived_data.cabinet.oam_subnet}}/29"
+              - "delete protocols static route {{derived_data.cabinet.bearer_subnet}}/28"
+              - "delete protocols static route {{derived_data.cabinet.oam_subnet}}/29"
+              - "commit"
+
+        - name: delete the NodeB Bearer and OAM from the OSPF routing configuration, remove the blackhole static routes for the NodeB Bearer & OAM short-haul IP subnets
+          vars:
+            - current_step: {step: +, progress: +, section: "Implementation"}
+          vyos_command:
+            commands: "{{ cli2  + [ 'exit' ]}}"           
+          register: siad_nodeb_routes
+        # Step 5 end
+
+        # Verification Step (MOP Step 12)
+        - name: From the SIAD verify the proper static routes were removed and that no other routes were removed incorrectly
+          vars:
+            - current_step: {step: +, progress: +, section: "Implementation"}
+          vyos_command:
+            commands: 
+              - config
+              - show protocols static route
+              - exit
+          register: siad_verify_static_routes
+
+        - name: Verify to check static routes are deleted properly 
+          vars:
+            - log_footer: True        
+          assert:
+            that: 
+              - siad_verify_static_routes.stdout is not search('route '+derived_data.cabinet.bearer_subnet)
+              - siad_verify_static_routes.stdout is not search('route '+derived_data.cabinet.oam_subnet)
+            fail_msg:  "CORRECT STATIC ROUTES WERE NOT DELETED"
+            success_msg:  "CORRECT STATIC ROUTES WERE DELETED" 
+      when: cabinet_type == 'nb'
+
+    # Step 6 start (MOP Step 10)
+    - block:
+        - name: Check if the BBU is the last in the VLAN 
+          set_fact: 
+            ipv6_list: "{{ ( ipv6_list|default([]) ) + [( derived_data.cabinet.ipv6_oam_subnet61 | ansible.netcommon.ipmath( item + 1) )] }}" 
+          loop: "{{ range(8) }}"
+
+        - name: Check BBU availblity 
+          vyos_command: 
+            commands: 
+              - "show configuration commands | egrep -i {{ item }}" 
+          loop: "{{ ipv6_list }}" 
+          register: subnet_check_output 
+    
+        - debug: msg="{{item.stdout}}" 
+          loop: "{{subnet_check_output.results }}"
+           
+        - set_fact: 
+            bbu_list: "{{ ( bbu_list|default([]) ) + [ item.stdout[0] ] }}" 
+          when: "'/64' in item.stdout[0]" 
+          loop: "{{ subnet_check_output.results }}" 
+    
+        - name: Determine if last BBU 
+          set_fact: 
+            f_last_bbu: True 
+            msg: "Other BBU(s) Found in the Vlan" 
+          when: 
+            - "{{bbu_list | length}} == 1" 
+
+        - name: Remove the blackhole static routes for the e-NodeB Bearer & OAM short-haul IP subnets
+          vars:
+            - current_step: {step: +, progress: +, section: "Implementation"}
+          vyos_command:
+            commands: 
+              - "config"
+              - "delete protocols static route6 {{derived_data.cabinet.ipv6_oam_subnet61}}/61"
+              - "delete protocols static route6 '{{derived_data.cabinet.ipv6_bearer_subnet61}}/61"
+              - "commit"      
+          register: siad_enodeb_routes
+          when: 
+            - f_last_bbu
+
+        - name: Remove the blackhole static routes for the e-NodeB Bearer & OAM short-haul IP subnets for Mixed mode
+          vars:
+            - current_step: {step: +, progress: +, section: "Implementation"}
+          vyos_command:
+            commands: 
+              - "config"
+              - "delete protocols static route6 {{derived_data.cabinet.mmbb_ipv6_subnet}}/61"
+              - "commit"      
+          register: siad_enodeb_routes
+          when: 
+            - f_mmbb_vlan
+            - f_last_bbu
+    
+        # Step 7 start (MOP Step 11)
+        - name: Remove the blackhole static routes for BBU Timing VLAN PTP short-haul IP subnets
+          vars:
+            - current_step: {step: +, progress: +, section: "Implementation"}
+          vyos_command:
+            commands: 
+              - "config"
+              - "delete protocols ospf area {{ospf_area}} network {{derived_data.cabinet.bc_ptp_subnet}}/30"
+              - "delete protocols static route {{derived_data.cabinet.bc_ptp_subnet}}/30"
+              - "commit"      
+          register: siad_enodeb_ptp_routes
+        # Step 7 end
+
+        # Verification Step (MOP Step 12)
+        - name: From the SIAD verify the proper static routes were removed and that no other routes were removed incorrectly
+          vars:
+            - current_step: {step: +, progress: +, section: "Implementation"}
+          vyos_command:
+            commands: 
+              - config
+              - show protocols static route6
+              - exit
+          register: siad_verify_static_routes
+
+        - name: Verify to check static routes are deleted properly 
+          vars:
+            - log_footer: True        
+          assert:
+            that: 
+              - siad_verify_static_routes.stdout is not search('route6 '+derived_data.cabinet.ipv6_bearer_subnet61)
+              - siad_verify_static_routes.stdout is not search('route6 '+derived_data.cabinet.ipv6_oam_subnet61)
+            fail_msg:  "CORRECT STATIC ROUTES WERE NOT DELETED"
+            success_msg:  "CORRECT STATIC ROUTES WERE DELETED" 
+      when: cabinet_type == 'enb'
+      # Step 6 end
+    
+    # Step 9 start (MOP Step 13)
+    - set_fact:
+        port_num: "{{ derived_data.cabinet.siad_port | regex_replace('(dp0xe)(\\d*)','\\2') }}"
+        
+    - name: run script to get the clockport number based on {{derived_data.siad.architecture}} and {{port_num}}
+      script: "filter_plugins/clockport.py '{{derived_data.siad.architecture}}' '{{port_num}}'"
+      register: clockport
+    
+    - name: Delete SHORTHAUL BOUNDARY CLOCK ONLY
+      vars:
+        - current_step: {step: +, progress: +, section: "Implementation"}
+      vyos_command:
+        commands: 
+          - "config"
+          - "delete service ptp instance 0 port-ds-list {{item}}"
+          - "commit"      
+      register: siad_enodeb_ptp_routes
+      with_items: "{{clockport.stdout}}"
+      when: 
+        - cabinet_type == 'enb'
+        - f_bc_ptp_vlan
+    # Step 9 end
